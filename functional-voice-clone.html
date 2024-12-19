@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Voice Clone</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.15.0/tf.min.js"></script>
+</head>
+<body>
+    <div>
+        <h2>Source Voice</h2>
+        <button id="recordSource">Record Source</button>
+        <button id="stopSource" disabled>Stop</button>
+        <div>Source Status: <span id="sourceStatus">Ready</span></div>
+        <audio id="sourceAudio" controls></audio>
+    </div>
+
+    <div>
+        <h2>Target Voice</h2>
+        <button id="recordTarget">Record Target</button>
+        <button id="stopTarget" disabled>Stop</button>
+        <div>Target Status: <span id="targetStatus">Ready</span></div>
+        <audio id="targetAudio" controls></audio>
+    </div>
+
+    <div>
+        <h2>Processing</h2>
+        <button id="processButton" disabled>Process Voice</button>
+        <div>Processing Status: <span id="processStatus">Waiting</span></div>
+        <div>Progress: <span id="progress">0</span>%</div>
+        <audio id="outputAudio" controls></audio>
+    </div>
+
+    <script>
+        let sourceRecorder = null;
+        let targetRecorder = null;
+        let sourceChunks = [];
+        let targetChunks = [];
+        let sourceBuffer = null;
+        let targetBuffer = null;
+        let audioContext = null;
+        let model = null;
+
+        // 初期化処理
+        async function init() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                await initializeModel();
+                setupEventListeners();
+            } catch (error) {
+                console.error('Initialization error:', error);
+            }
+        }
+
+        // TensorFlow.jsモデルの初期化
+        async function initializeModel() {
+            try {
+                // 基本的な音声変換モデルの構築
+                model = tf.sequential();
+                
+                // エンコーダー層
+                model.add(tf.layers.conv1d({
+                    filters: 256,
+                    kernelSize: 5,
+                    strides: 1,
+                    padding: 'same',
+                    activation: 'relu',
+                    inputShape: [1024, 1]
+                }));
+                
+                model.add(tf.layers.conv1d({
+                    filters: 512,
+                    kernelSize: 5,
+                    strides: 2,
+                    padding: 'same',
+                    activation: 'relu'
+                }));
+
+                // 中間層
+                model.add(tf.layers.conv1d({
+                    filters: 512,
+                    kernelSize: 5,
+                    strides: 1,
+                    padding: 'same',
+                    activation: 'relu'
+                }));
+
+                // デコーダー層
+                model.add(tf.layers.conv1dTranspose({
+                    filters: 256,
+                    kernelSize: 5,
+                    strides: 2,
+                    padding: 'same',
+                    activation: 'relu'
+                }));
+
+                model.add(tf.layers.conv1d({
+                    filters: 1,
+                    kernelSize: 5,
+                    strides: 1,
+                    padding: 'same',
+                    activation: 'tanh'
+                }));
+
+                model.compile({
+                    optimizer: 'adam',
+                    loss: 'meanSquaredError'
+                });
+
+                document.getElementById('processStatus').textContent = 'Model Ready';
+            } catch (error) {
+                console.error('Model initialization error:', error);
+                document.getElementById('processStatus').textContent = 'Model Error';
+            }
+        }
+
+        // イベントリスナーの設定
+        function setupEventListeners() {
+            document.getElementById('recordSource').addEventListener('click', () => startRecording('source'));
+            document.getElementById('stopSource').addEventListener('click', () => stopRecording('source'));
+            document.getElementById('recordTarget').addEventListener('click', () => startRecording('target'));
+            document.getElementById('stopTarget').addEventListener('click', () => stopRecording('target'));
+            document.getElementById('processButton').addEventListener('click', processAudio);
+        }
+
+        // 録音開始
+        async function startRecording(type) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const recorder = new MediaRecorder(stream);
+                const chunks = [];
+
+                recorder.ondataavailable = (e) => chunks.push(e.data);
+                recorder.onstop = async () => {
+                    const blob = new Blob(chunks, { type: 'audio/wav' });
+                    const arrayBuffer = await blob.arrayBuffer();
+                    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                    
+                    if (type === 'source') {
+                        sourceBuffer = audioBuffer;
+                        document.getElementById('sourceAudio').src = URL.createObjectURL(blob);
+                    } else {
+                        targetBuffer = audioBuffer;
+                        document.getElementById('targetAudio').src = URL.createObjectURL(blob);
+                    }
+
+                    checkProcessingAvailability();
+                };
+
+                recorder.start();
+                if (type === 'source') {
+                    sourceRecorder = recorder;
+                    document.getElementById('recordSource').disabled = true;
+                    document.getElementById('stopSource').disabled = false;
+                    document.getElementById('sourceStatus').textContent = 'Recording...';
+                } else {
+                    targetRecorder = recorder;
+                    document.getElementById('recordTarget').disabled = true;
+                    document.getElementById('stopTarget').disabled = false;
+                    document.getElementById('targetStatus').textContent = 'Recording...';
+                }
+            } catch (error) {
+                console.error('Recording error:', error);
+            }
+        }
+
+        // 録音停止
+        function stopRecording(type) {
+            if (type === 'source' && sourceRecorder) {
+                sourceRecorder.stop();
+                document.getElementById('recordSource').disabled = false;
+                document.getElementById('stopSource').disabled = true;
+                document.getElementById('sourceStatus').textContent = 'Recorded';
+            } else if (type === 'target' && targetRecorder) {
+                targetRecorder.stop();
+                document.getElementById('recordTarget').disabled = false;
+                document.getElementById('stopTarget').disabled = true;
+                document.getElementById('targetStatus').textContent = 'Recorded';
+            }
+        }
+
+        // 処理可能状態のチェック
+        function checkProcessingAvailability() {
+            const processButton = document.getElementById('processButton');
+            processButton.disabled = !(sourceBuffer && targetBuffer);
+        }
+
+        // 音声処理
+        async function processAudio() {
+            try {
+                document.getElementById('processStatus').textContent = 'Processing...';
+                document.getElementById('processButton').disabled = true;
+
+                // 音声データの前処理
+                const sourceData = await preprocessAudio(sourceBuffer);
+                const targetData = await preprocessAudio(targetBuffer);
+
+                // モデルの学習
+                await trainModel(sourceData, targetData);
+
+                // 音声の変換
+                const convertedData = await convertVoice(sourceData);
+
+                // 変換された音声の再生
+                const outputAudio = await synthesizeAudio(convertedData);
+                document.getElementById('outputAudio').src = URL.createObjectURL(outputAudio);
+
+                document.getElementById('processStatus').textContent = 'Complete';
+                document.getElementById('processButton').disabled = false;
+            } catch (error) {
+                console.error('Processing error:', error);
+                document.getElementById('processStatus').textContent = 'Error';
+            }
+        }
+
+        // 音声データの前処理
+        async function preprocessAudio(audioBuffer) {
+            const data = audioBuffer.getChannelData(0);
+            // フレーム分割
+            const frames = [];
+            const frameSize = 1024;
+            const hopSize = 512;
+
+            for (let i = 0; i < data.length - frameSize; i += hopSize) {
+                const frame = data.slice(i, i + frameSize);
+                frames.push(frame);
+            }
+
+            // スペクトル変換
+            return tf.tensor(frames).expandDims(-1);
+        }
+
+        // モデルの学習
+        async function trainModel(sourceData, targetData) {
+            const epochs = 50;
+            let currentEpoch = 0;
+
+            await model.fit(sourceData, targetData, {
+                epochs: epochs,
+                batchSize: 32,
+                callbacks: {
+                    onEpochEnd: async (epoch, logs) => {
+                        currentEpoch = epoch + 1;
+                        const progress = Math.round((currentEpoch / epochs) * 100);
+                        document.getElementById('progress').textContent = progress;
+                    }
+                }
+            });
+        }
+
+        // 音声変換
+        async function convertVoice(sourceData) {
+            return model.predict(sourceData);
+        }
+
+        // 音声合成
+        async function synthesizeAudio(convertedData) {
+            const audioData = await convertedData.array();
+            const sampleRate = 44100;
+            const frameSize = 1024;
+            const hopSize = 512;
+
+            // オーバーラップ加算
+            const outputLength = (audioData.length - 1) * hopSize + frameSize;
+            const output = new Float32Array(outputLength);
+
+            for (let i = 0; i < audioData.length; i++) {
+                const frame = audioData[i];
+                const startIdx = i * hopSize;
+                for (let j = 0; j < frameSize; j++) {
+                    output[startIdx + j] += frame[j];
+                }
+            }
+
+            // 正規化
+            const maxVal = Math.max(...output.map(Math.abs));
+            const normalizedOutput = output.map(x => x / maxVal);
+
+            // WAVファイル作成
+            const wavBuffer = createWavFile(normalizedOutput, sampleRate);
+            return new Blob([wavBuffer], { type: 'audio/wav' });
+        }
+
+        // WAVファイルの作成
+        function createWavFile(audioData, sampleRate) {
+            const buffer = new ArrayBuffer(44 + audioData.length * 2);
+            const view = new DataView(buffer);
+
+            // WAVヘッダーの書き込み
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + audioData.length * 2, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, audioData.length * 2, true);
+
+            // オーディオデータの書き込み
+            const length = audioData.length;
+            let index = 44;
+            for (let i = 0; i < length; i++) {
+                view.setInt16(index, audioData[i] * 32767, true);
+                index += 2;
+            }
+
+            return buffer;
+        }
+
+        // 文字列の書き込み
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+
+        // アプリケーションの初期化
+        init();
+    </script>
+</body>
+</html>
